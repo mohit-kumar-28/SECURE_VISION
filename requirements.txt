@@ -1,0 +1,7 @@
+streamlit
+streamlit-webrtc
+ultralytics
+shapely
+opencv-python
+av
+numpy

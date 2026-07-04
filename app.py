@@ -1,170 +1,192 @@
+import streamlit as st
+from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration
+from streamlit_autorefresh import st_autorefresh
 from ultralytics import YOLO
-import cv2
-import numpy as np
 from shapely.geometry import Point, Polygon
+import numpy as np
+import av
+import cv2
 import csv
-from datetime import datetime
 import os
 import time
+import threading
+from datetime import datetime
 
-# Load model
-model = YOLO("best.pt")
-names = model.names
-COOLDOWN = 5  # seconds
+# =================================================================
+# Page setup (matches report: "Streamlit Page Setup" component)
+# =================================================================
+st.set_page_config(page_title="TATASecure Vision", page_icon="🛡️", layout="wide")
 
-last_helmet_log = 0
-last_vest_log = 0
-last_zone_log = 0
+CONF_THRESH = 0.25
+COOLDOWN = 5  # seconds, same as the original script
 
-# Open webcam
-cap = cv2.VideoCapture(0)
+PERSON_LABEL = "human"
+HELMET_LABEL = "helmet"
+VEST_LABEL = "vest"
 
-# CSV log file
-log_file = "violations.csv"
+LOG_FILE = "violations.csv"
+if not os.path.exists(LOG_FILE):
+    with open(LOG_FILE, "w", newline="") as f:
+        csv.writer(f).writerow(["Timestamp", "Violation"])
 
-if not os.path.exists(log_file):
-    with open(log_file, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["Timestamp", "Violation"])
+# Danger zone polygon (Region Compliance module, Shapely-based)
+danger_zone = Polygon([(100, 100), (500, 100), (500, 400), (100, 400)])
+zone_points = np.array([(100, 100), (500, 100), (500, 400), (100, 400)])
 
-# Logging function
-def log_violation(violation_type):
+
+def normalize(label: str) -> str:
+    return label.lower().replace(" ", "-").replace("_", "-")
+
+
+def log_violation(violation_type: str):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with open(LOG_FILE, "a", newline="") as f:
+        csv.writer(f).writerow([timestamp, violation_type])
 
-    with open(log_file, "a", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow([timestamp, violation_type])
 
-# Danger Zone Coordinates
-danger_zone = Polygon([
-    (100, 100),
-    (500, 100),
-    (500, 400),
-    (100, 400)
-])
+# =================================================================
+# Model loading (cached so it only loads once per session)
+# =================================================================
+@st.cache_resource
+def load_model():
+    return YOLO("models/best.pt")
 
-zone_points = np.array([
-    (100, 100),
-    (500, 100),
-    (500, 400),
-    (100, 400)
-])
 
-while True:
+model = load_model()
 
-    ret, frame = cap.read()
 
-    if not ret:
-        break
+# =================================================================
+# Video processor — runs the inference + violation logic per frame
+# =================================================================
+class PPEVideoProcessor(VideoProcessorBase):
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.last_helmet_log = 0
+        self.last_vest_log = 0
+        self.last_zone_log = 0
+        self.live_counts = {"persons": 0, "helmet_violations": 0, "vest_violations": 0}
 
-    results = model(frame)
-    annotated = results[0].plot()
+    def recv(self, frame):
+        img = frame.to_ndarray(format="bgr24")
+        results = model(img, conf=CONF_THRESH)[0]
+        annotated = results.plot()
 
-    persons = 0
-    helmets = 0
-    vests = 0
+        persons = 0
+        helmets = 0
+        vests = 0
+        now = time.time()
 
-    for box in results[0].boxes:
+        for box in results.boxes:
+            label = normalize(model.names[int(box.cls[0])])
 
-        label = names[int(box.cls[0])]
-        conf = float(box.conf[0])
+            if label == PERSON_LABEL:
+                persons += 1
+                x1, y1, x2, y2 = box.xyxy[0]
+                center = Point(int((x1 + x2) / 2), int((y1 + y2) / 2))
+                if danger_zone.contains(center):
+                    cv2.putText(annotated, "ZONE VIOLATION", (20, 150),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                    with self.lock:
+                        if now - self.last_zone_log > COOLDOWN:
+                            log_violation("ZONE VIOLATION")
+                            self.last_zone_log = now
 
-        print(f"{label}: {conf:.2f}")
+            elif label == HELMET_LABEL:
+                helmets += 1
+            elif label == VEST_LABEL:
+                vests += 1
 
-        if label == "human":
-            persons += 1
+        # No dedicated "no-helmet"/"no-vest" classes in this model, so
+        # violations are inferred by shortage: more people than PPE items
+        helmet_violation = persons > helmets
+        vest_violation = persons > vests
 
-        elif label == "helmet":
-            helmets += 1
+        if helmet_violation:
+            cv2.putText(annotated, "HELMET VIOLATION", (20, 50),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+            with self.lock:
+                if now - self.last_helmet_log > COOLDOWN:
+                    log_violation("HELMET VIOLATION")
+                    self.last_helmet_log = now
 
-        elif label == "vest":
-            vests += 1
+        if vest_violation:
+            cv2.putText(annotated, "VEST VIOLATION", (20, 100),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+            with self.lock:
+                if now - self.last_vest_log > COOLDOWN:
+                    log_violation("VEST VIOLATION")
+                    self.last_vest_log = now
 
-        # Zone violation detection
-        if label == "human":
+        cv2.polylines(annotated, [zone_points], True, (0, 0, 255), 2)
 
-            x1, y1, x2, y2 = box.xyxy[0]
+        with self.lock:
+            self.live_counts = {
+                "persons": persons,
+                "helmet_violations": int(helmet_violation),
+                "vest_violations": int(vest_violation),
+            }
 
-            center_x = int((x1 + x2) / 2)
-            center_y = int((y1 + y2) / 2)
+        return av.VideoFrame.from_ndarray(annotated, format="bgr24")
 
-            point = Point(center_x, center_y)
 
-            if danger_zone.contains(point):
+# =================================================================
+# UI layout
+# =================================================================
+st.markdown(
+    "<h1 style='text-align:center;'>TATA<span style='color:#F5A623;'>Secure</span> Vision</h1>"
+    "<p style='text-align:center; color:gray;'>Smart vision safeguarding workforce safety in real time</p>",
+    unsafe_allow_html=True,
+)
 
-                cv2.putText(
-                    annotated,
-                    "ZONE VIOLATION",
-                    (20, 150),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    1,
-                    (0, 0, 255),
-                    2
-                )
+col1, col2 = st.columns([2, 1])
 
-                current_time = time.time()
-
-                if current_time - last_zone_log > COOLDOWN:
-                    log_violation("ZONE VIOLATION")
-                    last_zone_log = current_time
-
-    # Draw danger zone
-    cv2.polylines(
-        annotated,
-        [zone_points],
-        True,
-        (0, 0, 255),
-        2
+with col1:
+    st.subheader("Live PPE & Zone Monitoring")
+    ctx = webrtc_streamer(
+        key="ppe-detection",
+        video_processor_factory=PPEVideoProcessor,
+        rtc_configuration=RTCConfiguration(
+            {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+        ),
+        media_stream_constraints={"video": True, "audio": False},
     )
 
-    # Helmet violation
-    if persons > helmets:
+with col2:
+    st.subheader("Live Status")
 
-        cv2.putText(
-            annotated,
-            "HELMET VIOLATION",
-            (20, 50),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1,
-            (0, 0, 255),
-            2
-        )
+    # webrtc runs frame processing on a background thread, so the main
+    # script needs to rerun periodically to pick up updated live_counts —
+    # otherwise this panel stays frozen at its initial values.
+    st_autorefresh(interval=1000, key="status_refresh")
 
-        current_time = time.time()
+    status_box = st.empty()
 
-        if current_time - last_helmet_log > COOLDOWN:
-            log_violation("HELMET VIOLATION")
-            last_helmet_log = current_time
+    if ctx.video_processor:
+        counts = ctx.video_processor.live_counts
+        status_box.metric("Persons Detected", counts["persons"])
+        st.metric("Helmet Violations", counts["helmet_violations"])
+        st.metric("Vest Violations", counts["vest_violations"])
+    else:
+        status_box.info("Start the camera to see live detections.")
 
-    # Vest violation
-    if persons > vests:
+    st.subheader("Recent Violation Log")
+    if os.path.exists(LOG_FILE):
+        with open(LOG_FILE, "r") as f:
+            raw_rows = list(csv.reader(f))[1:]  # skip header
 
-        cv2.putText(
-            annotated,
-            "VEST VIOLATION",
-            (20, 100),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1,
-            (0, 0, 255),
-            2
-        )
+        # Defensive parsing: only keep rows with at least 2 columns,
+        # and only use the first two (timestamp, violation) even if
+        # a row has extra stray columns from an older log format.
+        rows = [row for row in raw_rows if len(row) >= 2]
 
-        current_time = time.time()
+        recent = rows[-10:][::-1]
+        if recent:
+            for row in recent:
+                ts, violation = row[0], row[1]
+                st.write(f"🔴 **{violation}** — {ts}")
+        else:
+            st.write("No violations logged yet.")
 
-        if current_time - last_vest_log > COOLDOWN:
-            log_violation("VEST VIOLATION")
-            last_vest_log = current_time
-
-    # Display counts
-    print(f"Persons: {persons}")
-    print(f"Helmets: {helmets}")
-    print(f"Vests: {vests}")
-
-    cv2.imshow("Smart Safety AI", annotated)
-
-    # Press ESC to exit
-    if cv2.waitKey(1) & 0xFF == 27:
-        break
-
-cap.release()
-cv2.destroyAllWindows()
+        skipped = len(raw_rows) - len(rows)
+        if skipped > 0:
+            st.caption(f"⚠️ Skipped {skipped} malformed row(s) in {LOG_FILE}.")
