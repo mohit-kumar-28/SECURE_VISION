@@ -25,6 +25,9 @@ HELMET_LABEL = "helmet"
 VEST_LABEL = "vest"
 
 LOG_FILE = "violations.csv"
+SCREENSHOT_DIR = "violation_screenshots"
+os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+
 if not os.path.exists(LOG_FILE):
     with open(LOG_FILE, "w", newline="") as f:
         csv.writer(f).writerow(["Timestamp", "Violation"])
@@ -42,6 +45,15 @@ def log_violation(violation_type: str):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with open(LOG_FILE, "a", newline="") as f:
         csv.writer(f).writerow([timestamp, violation_type])
+
+
+def save_screenshot(frame_img, violation_type: str):
+    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    safe_type = violation_type.lower().replace(" ", "_")
+    filename = f"{safe_type}_{ts}.jpg"
+    path = os.path.join(SCREENSHOT_DIR, filename)
+    cv2.imwrite(path, frame_img)
+    return path
 
 
 # =================================================================
@@ -89,6 +101,7 @@ class PPEVideoProcessor(VideoProcessorBase):
                     with self.lock:
                         if now - self.last_zone_log > COOLDOWN:
                             log_violation("ZONE VIOLATION")
+                            save_screenshot(annotated, "ZONE VIOLATION")
                             self.last_zone_log = now
 
             elif label == HELMET_LABEL:
@@ -107,6 +120,7 @@ class PPEVideoProcessor(VideoProcessorBase):
             with self.lock:
                 if now - self.last_helmet_log > COOLDOWN:
                     log_violation("HELMET VIOLATION")
+                    save_screenshot(annotated, "HELMET VIOLATION")
                     self.last_helmet_log = now
 
         if vest_violation:
@@ -115,6 +129,7 @@ class PPEVideoProcessor(VideoProcessorBase):
             with self.lock:
                 if now - self.last_vest_log > COOLDOWN:
                     log_violation("VEST VIOLATION")
+                    save_screenshot(annotated, "VEST VIOLATION")
                     self.last_vest_log = now
 
         cv2.polylines(annotated, [zone_points], True, (0, 0, 255), 2)
@@ -190,3 +205,11 @@ with col2:
         skipped = len(raw_rows) - len(rows)
         if skipped > 0:
             st.caption(f"⚠️ Skipped {skipped} malformed row(s) in {LOG_FILE}.")
+
+    st.subheader("Latest Snapshot")
+    if os.path.exists(SCREENSHOT_DIR):
+        shots = sorted(os.listdir(SCREENSHOT_DIR))
+        if shots:
+            st.image(os.path.join(SCREENSHOT_DIR, shots[-1]), caption=shots[-1])
+        else:
+            st.write("No screenshots saved yet.")
